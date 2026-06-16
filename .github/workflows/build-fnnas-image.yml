@@ -1,0 +1,117 @@
+#=====================================================================================
+# 精简版：仅编译 dg-tn3568 设备，支持 GPU 转码
+# 原项目：https://github.com/ophub/fnnas
+# dtb和dts来源: https://github.com/FrozenGEE/fnnas-rk35xx
+#=====================================================================================
+
+name: Build FnNAS Image for DG-TN3568
+
+on:
+  workflow_dispatch:    # 手动触发，不自动运行
+
+env:
+  TZ: Etc/UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # ============================================================
+      # 嫁接你的专属 dts 文件（来自 fnnas-rk35xx 仓库）
+      # ============================================================
+      - name: Download custom DTS from fnnas-rk35xx
+        run: |
+          # 创建目标目录
+          mkdir -p make-fnnas/kernel/arch/arm64/boot/dts/rockchip/
+
+          # 下载 dg-tn3568 的 dts 和三个依赖的 dtsi 文件
+          wget -P make-fnnas/kernel/arch/arm64/boot/dts/rockchip/ \
+            https://raw.githubusercontent.com/FrozenGEE/fnnas-rk35xx/main/rockchip/dts/dg-tn3568.dts
+          wget -P make-fnnas/kernel/arch/arm64/boot/dts/rockchip/ \
+            https://raw.githubusercontent.com/FrozenGEE/fnnas-rk35xx/main/rockchip/dts/rk3568-vngpu.dtsi
+          wget -P make-fnnas/kernel/arch/arm64/boot/dts/rockchip/ \
+            https://raw.githubusercontent.com/FrozenGEE/fnnas-rk35xx/main/rockchip/dts/rk3568-vngpu-rk809.dtsi
+          wget -P make-fnnas/kernel/arch/arm64/boot/dts/rockchip/ \
+            https://raw.githubusercontent.com/FrozenGEE/fnnas-rk35xx/main/rockchip/dts/rk3568-ramoops.dtsi
+
+          # 确认文件下载成功
+          ls -la make-fnnas/kernel/arch/arm64/boot/dts/rockchip/
+
+      - name: Initialize build environment
+        run: |
+          # 清理磁盘空间
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile
+
+          # 安装依赖
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-make-fnnas-depends)
+
+          # 设置时区
+          sudo -E timedatectl set-timezone "${TZ}"
+
+      - name: Create virtual disk for extended storage
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space"; exit 1; }
+
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          sudo mkfs.ext4 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          mkdir -p /builder/fnnas
+
+      - name: Download official fnnas base image
+        working-directory: /builder/fnnas
+        run: |
+          # 直接下载最新的 rockchip 底包（rockchip_1253）
+          curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            https://github.com/ophub/fnnas/releases/download/fnnas_base_image/fnnas-rockchip_1253.img.xz \
+            -o fnnas-rockchip_1253.img.xz
+
+          # 创建软链接供后续步骤使用
+          ln -sf /builder/fnnas ${{ github.workspace }}/fnnas
+
+          echo "status=success"
+
+      - name: Build FnNAS for dg-tn3568
+        uses: ophub/fnnas@main
+        with:
+          fnnas_path: fnnas/*.img.xz
+          fnnas_board: dg-tn3568           # 只编译你的设备
+          fnnas_kernel: 6.12.y             # 飞牛官方 337+ 使用的内核系列
+          auto_kernel: true
+          kernel_repo: ophub/fnnas
+          rootfs_expand: 16
+          builder_name: dg-tn3568-builder
+
+      - name: Upload firmware to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        with:
+          tag: dg-tn3568_firmware_$(date '+%Y%m%d')
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## DG-TN3568 专用固件
+            - 基于飞牛官方 rockchip 底包构建
+            - 已集成 GPU 转码补丁（rkvdec/mpp 节点）
+            - 内核版本：6.12.y
+            - 刷机后如无法启动，请替换 u-boot
